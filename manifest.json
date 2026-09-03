@@ -1,0 +1,210 @@
+{
+  "schemaVersion": 1,
+  "id": "com.cuthriell.binnacle",
+  "name": "Binnacle",
+  "version": "5.5.0",
+  "author": "j",
+  "license": "MIT",
+  "description": "System instruments for the bar: discovers every sensor, GPU and filesystem present and builds instruments for what it finds, with CPU-by-program accounting that still sees processes after they exit.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Binnacle",
+    "description": "Live CPU/GPU/thermal/memory/network/disk instruments; click for a detail panel.",
+    "category": "System",
+    "aliases": [
+      "binnacle",
+      "system-stats",
+      "cpu",
+      "gpu",
+      "monitor",
+      "sensors",
+      "temperature"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "interval": 2000,
+      "history": 32,
+      "graphWidth": 38,
+      "netFloorBytes": 131072,
+      "tempFloorC": 30,
+      "tempCeilingC": 100,
+      "placeCpu": "Bar + panel",
+      "placeIgpu": "Bar + panel",
+      "placeDgpu": "Bar + panel",
+      "placeTemps": "Bar + panel",
+      "placeMem": "Bar + panel",
+      "placeNet": "Bar + panel",
+      "placeDisk": "Bar + panel",
+      "placeTop": "Panel only",
+      "leaderWindow": 60
+    },
+    "schema": [
+      {
+        "key": "interval",
+        "type": "integer",
+        "label": "Sample interval (ms)",
+        "min": 500,
+        "max": 10000,
+        "step": 500
+      },
+      {
+        "key": "history",
+        "type": "integer",
+        "label": "History samples per graph",
+        "min": 8,
+        "max": 120,
+        "step": 8
+      },
+      {
+        "key": "graphWidth",
+        "type": "integer",
+        "label": "Graph width (px)",
+        "min": 16,
+        "max": 120,
+        "step": 2
+      },
+      {
+        "key": "iconSize",
+        "type": "integer",
+        "label": "Icon size (px, blank follows the theme)",
+        "min": 8,
+        "max": 32,
+        "step": 1
+      },
+      {
+        "key": "netFloorBytes",
+        "type": "integer",
+        "label": "Network graph floor (bytes/s)",
+        "min": 8192,
+        "max": 10485760,
+        "step": 8192
+      },
+      {
+        "key": "tempFloorC",
+        "type": "integer",
+        "label": "Temperature dial floor (°C)",
+        "min": 0,
+        "max": 60,
+        "step": 5
+      },
+      {
+        "key": "tempCeilingC",
+        "type": "integer",
+        "label": "Dial ceiling for sensors with no critical point (°C)",
+        "min": 40,
+        "max": 120,
+        "step": 5
+      },
+      {
+        "key": "placeCpu",
+        "type": "enum",
+        "label": "CPU load",
+        "options": [
+          "Bar + panel",
+          "Panel only",
+          "Hidden"
+        ],
+        "defaultValue": "Bar + panel",
+        "description": "Where cpu load appears. \"Panel only\" keeps it out of the bar strip but in the dropdown."
+      },
+      {
+        "key": "placeIgpu",
+        "type": "enum",
+        "label": "Integrated GPU",
+        "options": [
+          "Bar + panel",
+          "Panel only",
+          "Hidden"
+        ],
+        "defaultValue": "Bar + panel",
+        "description": "Where integrated gpu appears. \"Panel only\" keeps it out of the bar strip but in the dropdown."
+      },
+      {
+        "key": "placeDgpu",
+        "type": "enum",
+        "label": "Discrete GPU",
+        "options": [
+          "Bar + panel",
+          "Panel only",
+          "Hidden"
+        ],
+        "defaultValue": "Bar + panel",
+        "description": "Where discrete gpu appears. \"Panel only\" keeps it out of the bar strip but in the dropdown."
+      },
+      {
+        "key": "placeTemps",
+        "type": "enum",
+        "label": "Temperatures",
+        "options": [
+          "Bar + panel",
+          "Panel only",
+          "Hidden"
+        ],
+        "defaultValue": "Bar + panel",
+        "description": "Where temperatures appears. \"Panel only\" keeps it out of the bar strip but in the dropdown."
+      },
+      {
+        "key": "placeMem",
+        "type": "enum",
+        "label": "Memory",
+        "options": [
+          "Bar + panel",
+          "Panel only",
+          "Hidden"
+        ],
+        "defaultValue": "Bar + panel",
+        "description": "Where memory appears. \"Panel only\" keeps it out of the bar strip but in the dropdown."
+      },
+      {
+        "key": "placeNet",
+        "type": "enum",
+        "label": "Network",
+        "options": [
+          "Bar + panel",
+          "Panel only",
+          "Hidden"
+        ],
+        "defaultValue": "Bar + panel",
+        "description": "Where network appears. \"Panel only\" keeps it out of the bar strip but in the dropdown."
+      },
+      {
+        "key": "placeDisk",
+        "type": "enum",
+        "label": "Filesystems",
+        "options": [
+          "Bar + panel",
+          "Panel only",
+          "Hidden"
+        ],
+        "defaultValue": "Bar + panel",
+        "description": "Where filesystems appears. \"Panel only\" keeps it out of the bar strip but in the dropdown."
+      },
+      {
+        "key": "placeTop",
+        "type": "enum",
+        "label": "CPU-by-program leaderboard",
+        "options": [
+          "Panel only",
+          "Hidden"
+        ],
+        "defaultValue": "Panel only",
+        "description": "Ranks what actually used the CPU over the last window, including programs that have since exited."
+      },
+      {
+        "key": "leaderWindow",
+        "type": "integer",
+        "label": "Leaderboard window (seconds)",
+        "min": 10,
+        "max": 600,
+        "step": 10,
+        "description": "One cgroup sweep per window (~19ms). Longer windows cost less per tick."
+      }
+    ]
+  }
+}

@@ -1,0 +1,763 @@
+#!/bin/bash
+# binnacle-collect — live system load for the Omarchy bar, as discovered metrics.
+#
+# Usage:
+#   binnacle-collect                one JSON line (two samples 250ms apart)
+#   binnacle-collect --stream [ms]  one JSON line per interval, forever
+#   binnacle-collect --discover     print the discovered topology and exit
+#
+# CONTRACT. The output is a set of *discovered lists*, not fixed keys. Presence
+# is membership: a machine with no discrete GPU emits no "dgpu" entry, rather
+# than a zero. This is the difference between a widget that works here and one
+# that works anywhere — a flat contract forces the view to hard-code which
+# instruments exist, and then to invent labels for them.
+#
+#   load[]   {id,label,pct,scale}      cpu / igpu / dgpu / anything else found
+#   temps[]  {id,label,c,crit,tracks}  every populated thermal sensor
+#   caps[]   {id,label,used,size,pct}  every real filesystem
+#   mem, net, disk                     singletons
+#
+# `tracks` is how a temperature says which load entry it belongs beside, so the
+# view never needs to know that an Intel iGPU shares the CPU die.
+#
+# Labels come from the kernel (`tempN_label`) and from lspci, never from this
+# file. The machine already knows what its sensors are called.
+#
+# PERFORMANCE. In --stream mode discovery runs once and the sample loop touches
+# only /proc and /sys through bash builtins: `read -r x < file` forks nothing,
+# `x=$(cat file)` forks twice. A steady-state tick execs nothing at all. The
+# per-tick cost is ~2ms against ~15ms for a re-exec'd one-shot, because a cold
+# process pays execve + bash init + first-touch page faults every time.
+#
+# Two measured traps worth keeping in mind when editing:
+#   * `[[ $x =~ re ]]` costs ~105us under a UTF-8 locale against ~0 for the
+#     equivalent `case` glob. Hence LC_ALL=C and `case` throughout.
+#   * `sleep` is an exec (~5ms). The loop waits on `read -t` against a pipe
+#     that never delivers, which is a builtin.
+set -uo pipefail
+export LC_ALL=C
+
+INTERVAL_MS=2000
+MODE=oneshot
+case ${1:-} in
+  --stream)   MODE=stream; [[ -n ${2:-} ]] && INTERVAL_MS=$2
+              [[ -n ${3:-} ]] && LEADER_WINDOW_ARG=$3 ;;
+  --discover) MODE=discover ;;
+  "")         ;;
+  *)          printf 'usage: %s [--stream [ms] [leaderWindowSec]|--discover]\n' "${0##*/}" >&2; exit 2 ;;
+esac
+case $INTERVAL_MS in ''|*[!0-9]*) INTERVAL_MS=2000 ;; esac
+(( INTERVAL_MS < 200 )) && INTERVAL_MS=200
+
+# JSON string escape, answering in $ESC. Labels come from lspci and the kernel,
+# so quotes and backslashes are possible; control characters are not, and would
+# need \uXXXX.
+#
+# NOT `jstr() { ...; printf ... }` called as `$(jstr x)`: a command substitution
+# forks, and emit() escapes ~20 strings a tick. That alone measured 29ms/tick,
+# worse than re-exec'ing the whole script. Every label is discovered once and
+# never changes, so they are escaped once (esc_all) and only the interface name
+# — which can change — is escaped per tick.
+ESC=""
+esc() { local s=${1//\\/\\\\}; ESC=${s//\"/\\\"}; }
+
+esc_all() {
+  local i
+  for i in "${!G_LABEL[@]}"; do esc "${G_LABEL[i]}"; G_LABEL[i]=$ESC; done
+  for i in "${!T_ID[@]}"; do
+    esc "${T_ID[i]}";    T_ID[i]=$ESC
+    esc "${T_CHIP[i]}";  T_CHIP[i]=$ESC
+    esc "${T_LABEL[i]}"; T_LABEL[i]=$ESC
+  done
+  for i in "${!C_ID[@]}"; do
+    esc "${C_ID[i]}";    C_ID[i]=$ESC
+    esc "${C_LABEL[i]}"; C_LABEL[i]=$ESC
+  done
+  esc "$NV_LABEL"; NV_LABEL=$ESC
+}
+
+# ============================================================ discovery =====
+# Runs once. In --stream mode its cost is amortised to nothing, which is what
+# makes it affordable to shell out to lspci for human-readable GPU names.
+
+declare -a G_ID=() G_LABEL=() G_METHOD=() G_PATH=()        # load sources
+declare -a T_ID=() T_CHIP=() T_LABEL=() T_PATH=() T_CRIT=() T_TRACKS=() T_SLOW=() T_TS=() T_VAL=()
+declare -a D_PATH=()                              # block device stat files
+declare -a C_ID=() C_LABEL=() C_MOUNT=()                # capacity: filesystems
+declare -A CG_PREV=()                             # cgroup path -> usage_usec at last boundary
+CG_OK=0                                        # cgroup v2 present
+declare -a CG_OWN_KEYS=() CG_OWN_VALS=()              # per-node own delta, this window
+NV_PRESENT=0 NV_LABEL="" IGPU_SHARES_CPU_DIE=0
+NV_COPROC=0 NV_FD=-1 NV_PID=0
+
+# PCI address -> marketing name, e.g. "Kaby Lake-R GT2 [UHD Graphics 620]".
+declare -A PCI_NAME=()
+scan_pci_names() {
+  command -v lspci >/dev/null 2>&1 || return
+  local line addr name f
+  # `lspci -mm` quotes each field, so splitting on the quote character gives
+  # [0]=addr [1]=class [3]=vendor [5]=device. Walking `${x#*"}` by hand is
+  # off-by-one-quote territory; this is not.
+  while IFS= read -r line; do
+    IFS='"' read -r -a f <<< "$line"
+    addr=${f[0]%% *}
+    name=${f[5]:-}
+    # lspci reports "<codename> [<marketing name>]" for most GPUs. The bracket
+    # is what a person recognises, so prefer it when present:
+    # "GP108M [GeForce MX150]" -> "GeForce MX150".
+    case $name in
+      *\[*\]*) name=${name#*[}; name=${name%%]*} ;;
+    esac
+    [[ -n $addr && -n $name ]] && PCI_NAME[0000:$addr]=$name
+  done < <(lspci -mm 2>/dev/null | grep -iE '"(VGA|3D|Display)' 2>/dev/null)
+}
+
+discover_gpus() {
+  local card dev drv addr vendor name id
+  local have_integrated=0
+  for card in /sys/class/drm/card?; do
+    dev=$card/device
+    [[ -r $dev/vendor ]] || continue
+    drv=$(readlink -f "$dev/driver" 2>/dev/null); drv=${drv##*/}
+    addr=$(readlink -f "$dev" 2>/dev/null); addr=${addr##*/}
+    read -r vendor < "$dev/vendor" 2>/dev/null
+    name=${PCI_NAME[$addr]:-}
+
+    case $drv in
+      i915|xe)
+        # Intel integrated. rc6 ("render C6") is the GPU idle state; wall time
+        # not spent in it is time the GPU was busy. Needs no root, unlike
+        # intel_gpu_top, which wants perf_event_paranoid < 2.
+        [[ -r $card/power/rc6_residency_ms ]] || continue
+        G_ID+=("igpu"); G_LABEL+=("${name:-Intel integrated graphics}")
+        G_METHOD+=("rc6"); G_PATH+=("$card/power/rc6_residency_ms")
+        have_integrated=1
+        # i915 exposes no thermal sensor of its own on any part this runs on,
+        # so the package reading is the honest answer for it.
+        [[ -r $dev/hwmon ]] || IGPU_SHARES_CPU_DIE=1
+        ;;
+      amdgpu|radeon)
+        # amdgpu publishes a direct busy percentage — no inversion needed.
+        [[ -r $dev/gpu_busy_percent ]] || continue
+        case $addr in
+          0000:00:*) id=igpu; have_integrated=1 ;;
+          *)         id=dgpu ;;
+        esac
+        G_ID+=("$id"); G_LABEL+=("${name:-AMD graphics}")
+        G_METHOD+=("busy"); G_PATH+=("$dev/gpu_busy_percent")
+        ;;
+      nvidia)
+        # No sysfs utilisation counter exists; nvidia-smi is the only source.
+        command -v nvidia-smi >/dev/null 2>&1 || continue
+        NV_PRESENT=1; NV_LABEL=${name:-NVIDIA graphics}
+        G_ID+=("dgpu"); G_LABEL+=("$NV_LABEL")
+        G_METHOD+=("nvsmi"); G_PATH+=("")
+        ;;
+    esac
+  done
+  (( have_integrated )) || IGPU_SHARES_CPU_DIE=0
+
+  # Order the strip cpu -> igpu -> dgpu. Card numbering is not vendor-stable:
+  # on this machine card0 is the NVIDIA part and card1 the Intel one.
+  local -a oi=() ol=() om=() op=()
+  local i pass
+  for pass in igpu dgpu; do
+    for i in "${!G_ID[@]}"; do
+      [[ ${G_ID[i]} == "$pass" ]] || continue
+      oi+=("${G_ID[i]}"); ol+=("${G_LABEL[i]}"); om+=("${G_METHOD[i]}"); op+=("${G_PATH[i]}")
+    done
+  done
+  G_ID=("${oi[@]}"); G_LABEL=("${ol[@]}"); G_METHOD=("${om[@]}"); G_PATH=("${op[@]}")
+}
+
+# Time one read so an expensive sensor can be put on a slower cadence. The NVMe
+# composite sensor issues a SMART command and costs ~7ms here, against ~0.4ms
+# for coretemp; classifying by measurement rather than by chip name means this
+# works on hardware nobody tested it against.
+SLOW_SENSOR_US=2000
+probe_cost() {
+  local p=$1 t0 t1 _v
+  t0=${EPOCHREALTIME//[.,]/}
+  read -r _v < "$p" 2>/dev/null
+  t1=${EPOCHREALTIME//[.,]/}
+  printf '%s' $(( t1 - t0 ))
+}
+
+discover_temps() {
+  local h chip inp base label crit val cost tracks
+  local cpu_idx=-1
+  for h in /sys/class/hwmon/hwmon*; do
+    read -r chip < "$h/name" 2>/dev/null || continue
+    for inp in "$h"/temp*_input; do
+      [[ -r $inp ]] || continue
+      read -r val < "$inp" 2>/dev/null || continue
+      # A reading of exactly 0 means "not populated", not 0°C — the ThinkPad EC
+      # publishes eight slots and populates two.
+      case $val in ''|0|*[!0-9]*) continue ;; esac
+
+      base=${inp%_input}
+      label=""; [[ -r ${base}_label ]] && read -r label < "${base}_label" 2>/dev/null
+      # Per-core sensors duplicate the package reading; keep the package only.
+      case $label in "Core "[0-9]*) continue ;; esac
+      [[ -n $label ]] || label=$chip
+
+      crit=""
+      if [[ -r ${base}_crit ]]; then read -r crit < "${base}_crit" 2>/dev/null
+      elif [[ -r ${base}_max ]]; then read -r crit < "${base}_max" 2>/dev/null
+      fi
+      case $crit in ''|0|*[!0-9]*) crit="" ;; *) crit=$(( crit / 1000 )) ;; esac
+
+      tracks=""
+      case $chip in
+        coretemp|k10temp)
+          case $label in
+            "Package id"*|Tctl|Tdie|"$chip")
+              (( cpu_idx < 0 )) && { tracks="cpu"; cpu_idx=${#T_ID[@]}; }
+              ;;
+          esac
+          ;;
+        amdgpu) tracks="igpu" ;;
+      esac
+
+      cost=$(probe_cost "$inp")
+      T_ID+=("$chip/${base##*/}"); T_CHIP+=("$chip"); T_LABEL+=("$label"); T_PATH+=("$inp")
+      T_CRIT+=("$crit"); T_TRACKS+=("$tracks")
+      T_SLOW+=($(( cost > SLOW_SENSOR_US ? 1 : 0 ))); T_TS+=(0); T_VAL+=("")
+    done
+  done
+
+  # An Intel iGPU has no sensor of its own; it is the same die as the CPU, so
+  # the package reading is what its dial should show. Said once, here, instead
+  # of as a special case in the view.
+  if (( IGPU_SHARES_CPU_DIE && cpu_idx >= 0 )); then
+    T_TRACKS[cpu_idx]="cpu igpu"
+  fi
+}
+
+discover_disks() {
+  local d n
+  for d in /sys/block/*; do
+    n=${d##*/}
+    # /sys/block holds whole devices only (no partitions), but also dm-*, zram*
+    # and loop*, which would double-count.
+    case $n in nvme*|sd*|mmcblk*|vd*|hd*) ;; *) continue ;; esac
+    [[ -r $d/stat ]] && D_PATH+=("$d/stat")
+  done
+}
+
+# The leaderboard entities. cgroup v2 rather than /proc for two measured
+# reasons, and the second is the one that decides it.
+#
+#   cost — 116 nodes against 337 processes, and a tumbling window needs one
+#   sweep per window rather than a sample per tick.
+#
+#   correctness — /proc deltas can only see processes alive at *both* ends of
+#   the window. Measured here: of 2.34 CPU-s burned in one window, 1.78 (76%)
+#   was unattributable to any surviving PID. A leaderboard exists to explain
+#   spikes, and the things that cause spikes exit before you look. cgroup
+#   counters are charged up the hierarchy as work accrues, so a parent keeps
+#   what a child spent after that child is gone — verified at 1.63 CPU-s
+#   retained from a scope created and destroyed inside one window.
+# nvidia-smi costs ~48ms per invocation, essentially all of it process startup
+# and driver init — 25.8% of this collector's entire budget to read four
+# numbers. A daemon can pay that once: `nvidia-smi -l` loops internally and
+# costs 0.42ms per sample after init, measured. That is 114x cheaper per sample
+# and 5.7x cheaper as a rate even while sampling every second instead of every
+# twenty, so it is strictly better on both cost and resolution — and it retires
+# the one-shot path's blind spot, where a GPU job starting and ending inside the
+# idle window went unseen.
+#
+# Gated on runtime D3 being unsupported. Where the card *can* runtime-suspend, a
+# poller that touches it every second would hold it awake and cost far more
+# battery than it saves; those machines keep the TTL path.
+nv_start_coproc() {
+  [[ -n ${J_NO_COPROC:-} ]] && return
+  (( NV_PRESENT )) || return
+  local d3=""
+  [[ -r /proc/driver/nvidia/gpus ]] && d3=$(grep -h -i 'runtime d3' /proc/driver/nvidia/gpus/*/power 2>/dev/null)
+  case $d3 in
+    *"Not supported"*|"") ;;          # safe: the card never suspends
+    *) return ;;                       # D3 capable: leave it alone, use the TTL path
+  esac
+  exec {NV_FD}< <(nvidia-smi --query-gpu=utilization.gpu,temperature.gpu,memory.used,memory.total \
+                    --format=csv,noheader,nounits -l 1 2>/dev/null)
+  NV_PID=$!
+  NV_COPROC=1
+}
+
+discover_cgroups() {
+  # Unified v2 AND the cpu controller actually delegated. Checking only that
+  # cgroup.controllers exists is not enough: a container can mount v2 with no
+  # cpu controller, which yields zero cpu.stat files and an empty sweep.
+  local ctl=""
+  [[ -r /sys/fs/cgroup/cgroup.controllers ]] && read -r ctl < /sys/fs/cgroup/cgroup.controllers 2>/dev/null
+  case " ${ctl:-} " in *" cpu "*) CG_OK=1 ;; esac
+}
+
+discover_caps() {
+  local dev mnt fs seen=""
+  while read -r dev mnt fs _; do
+    case $dev in /dev/*) ;; *) continue ;; esac
+    case $fs in squashfs|iso9660|devtmpfs|tmpfs) continue ;; esac
+    # Subvolumes of one filesystem report identical usage; first mount wins.
+    case " $seen " in *" $dev "*) continue ;; esac
+    seen="$seen $dev"
+    mnt=${mnt//\\040/ }
+    C_ID+=("$dev"); C_LABEL+=("$mnt"); C_MOUNT+=("$mnt")
+  done < /proc/mounts
+}
+
+discover() {
+  scan_pci_names
+  discover_gpus
+  discover_temps
+  discover_disks
+  discover_caps
+  discover_cgroups
+  nv_start_coproc
+  esc_all
+}
+
+# ============================================================== sampling ====
+
+declare -a P_RC6=() C_RC6=()
+prev_wall=0 prev_total=0 prev_idle=0 prev_rx=0 prev_tx=0 prev_rd=0 prev_wr=0
+have_prev=0
+
+# Slow-moving facts, refreshed on their own cadence.
+NV_TS=0 NV_UTIL="" NV_TEMP="" NV_VUSED=0 NV_VTOTAL=0
+NV_IDLE_TTL=20   # only used on the one-shot fallback path
+CAP_TS=0
+# Filesystem capacity moves by fractions of a percent an hour. At 30s this was
+# 12.8% of the collector's entire budget for a number that had not changed;
+# `df` is a fork+exec per mount and there is no statvfs builtin.
+CAP_TTL=300
+LEADER_TS=0
+LEADER_WINDOW=${LEADER_WINDOW_ARG:-${J_LEADER_WINDOW:-60}}   # one sweep per window, not per tick
+LEADER_TOPK=5
+LEADER_JSON=""                          # rendered once per window, emitted every tick
+declare -a CAP_USED=() CAP_SIZE=()
+SLOW_TEMP_TTL=60   # sensors measured expensive at discovery (e.g. NVMe SMART)
+AUX_TEMP_TTL=10    # sensors that drive no dial — panel context only
+
+# One sweep per window. Cost measured at 12ms for 114 nodes in bash, which at
+# a 60s window and 2s cadence amortises to 0.40ms/tick — 5.7% of the tick, and
+# within its run-to-run noise. Ranking needs every node read (an unread node
+# could be the top consumer), so O(N) per window is the information-theoretic
+# floor for an exact answer; the only way below it is a compiled helper, which
+# would buy 0.33ms/tick — less than the tick's own +/-0.6ms spread.
+# One sweep per window boundary.
+#
+# `grep -r` rather than a bash loop over `find` output: it does enumeration and
+# read in a single fork at 19ms, against 30ms for find-plus-116-builtin-reads.
+# That inverts the fork-avoidance rule the rest of this file follows, and it was
+# measured, not assumed — a pure-bash recursive glob walk of the same tree costs
+# 67ms, because bash pays a stat per directory entry and a function call per
+# level. At a 60s window this amortises to 0.63ms/tick.
+#
+# The node set is rebuilt every sweep, not cached at startup. Cgroups appear and
+# vanish constantly (every app launch, every tmux command), and a stale set
+# silently misattributes a vanished child's work to its parent — which is how an
+# earlier version reported 17 CPU-s of "Hyprland" inside a 4s window.
+sweep_leaderboard() {
+  local line path val par
+  local -A cur=() delta=() childsum=()
+
+  while IFS= read -r line; do
+    path=${line%%:*}; path=${path%/cpu.stat}
+    val=${line##* }
+    case $val in ''|*[!0-9]*) continue ;; esac
+    cur[$path]=$val
+  done < <(grep -r --include=cpu.stat -H '^usage_usec' /sys/fs/cgroup 2>/dev/null)
+
+  (( ${#cur[@]} > 0 )) || return
+
+  for path in "${!cur[@]}"; do
+    if [[ -n ${CG_PREV[$path]:-} ]]; then
+      val=$(( cur[$path] - CG_PREV[$path] ))
+      (( val < 0 )) && val=0        # path reused by a different cgroup
+    else
+      val=0                          # first sight: baseline only, claim nothing
+    fi
+    delta[$path]=$val
+    childsum[$path]=0
+  done
+
+  # A node's own work is its delta minus what its surviving children account
+  # for. Counters are inclusive, so without this every ancestor out-ranks its
+  # own children; the remainder is processes sitting directly in the node plus
+  # any child cgroup that came and went inside the window.
+  for path in "${!delta[@]}"; do
+    par=${path%/*}
+    [[ -n ${delta[$par]:-} ]] && childsum[$par]=$(( childsum[$par] + delta[$path] ))
+  done
+
+  CG_OWN_KEYS=() CG_OWN_VALS=()
+  for path in "${!delta[@]}"; do
+    val=$(( delta[$path] - childsum[$path] ))
+    (( val <= 0 )) && continue        # reads of parent and child skew slightly
+    CG_OWN_KEYS+=("$path"); CG_OWN_VALS+=("$val")
+  done
+
+  CG_PREV=()
+  for path in "${!cur[@]}"; do CG_PREV[$path]=${cur[$path]}; done
+}
+
+render_leaderboard() {
+  local i k best bi total=0 out="" sep="" label pid
+  local -a taken=()
+  local -A byname=()
+  for i in "${!CG_OWN_VALS[@]}"; do total=$(( total + CG_OWN_VALS[i] )); done
+
+  # Select 2K candidates, label them, then merge by label and take K. One
+  # program can own several cgroups — two tmux scopes both running claude
+  # ranked as two rows — and the useful answer is what the *program* cost.
+  # Merging after selection bounds label resolution at 2K, not N.
+  local want=$(( LEADER_TOPK * 2 ))
+  for (( k = 0; k < want; k++ )); do
+    best=0 bi=-1
+    for i in "${!CG_OWN_VALS[@]}"; do
+      [[ -n ${taken[i]:-} ]] && continue
+      (( CG_OWN_VALS[i] > best )) && { best=${CG_OWN_VALS[i]}; bi=$i; }
+    done
+    (( bi < 0 || best == 0 )) && break
+    taken[bi]=1
+
+    # The *busiest* process in the cgroup, not the first one listed. A session
+    # scope lists its launcher first, so first-pid labelling reported
+    # "start-hyprland" for a scope whose real cost is Hyprland. Cumulative CPU
+    # is a heuristic for "the one that matters" — not the windowed figure — but
+    # it is one read per process and only for candidates actually considered.
+    # The scan is capped so a scope with hundreds of processes cannot blow the
+    # window budget.
+    label="" ; local bestcpu=-1 pcpu scanned=0 comm rest
+    while read -r pid; do
+      (( scanned++ > 64 )) && break
+      [[ -n $pid ]] || continue
+      read -r rest < "/proc/$pid/stat" 2>/dev/null || continue
+      comm=${rest#*\(}; comm=${comm%\)*}   # last paren: some comms contain parens
+      rest=${rest##*\) }
+      set -- $rest
+      pcpu=$(( ${12:-0} + ${13:-0} ))
+      if (( pcpu > bestcpu )); then bestcpu=$pcpu; label=$comm; fi
+    done < "${CG_OWN_KEYS[bi]}/cgroup.procs" 2>/dev/null
+
+    if [[ ${CG_OWN_KEYS[bi]} == "/sys/fs/cgroup" ]]; then
+      label="kernel + unscoped"
+    elif [[ -z $label ]]; then
+      # No live process: the work came from a child cgroup that has since gone.
+      label=${CG_OWN_KEYS[bi]##*/}
+      label=${label%.scope}; label=${label%.service}; label=${label%.slice}
+      label=${label#app-}; label=${label%%@*}
+      [[ -z $label ]] && label="exited"
+    fi
+    byname[$label]=$(( ${byname[$label]:-0} + CG_OWN_VALS[bi] ))
+  done
+
+  # Emit the K largest merged labels.
+  local -A used=()
+  for (( k = 0; k < LEADER_TOPK; k++ )); do
+    best=0; local bl=""
+    for label in "${!byname[@]}"; do
+      [[ -n ${used[$label]:-} ]] && continue
+      (( byname[$label] > best )) && { best=${byname[$label]}; bl=$label; }
+    done
+    [[ -z $bl ]] && break
+    used[$bl]=1
+    esc "$bl"
+    out+="${sep}{\"label\":\"$ESC\",\"ms\":$(( best / 1000 ))}"
+    sep=","
+  done
+  LEADER_JSON="\"top\":{\"window\":$LEADER_WINDOW,\"totalMs\":$(( total / 1000 )),\"entries\":[$out]}"
+}
+
+sample() {
+  local i p v
+
+  wall_us=${EPOCHREALTIME//[.,]/}
+  now_s=$EPOCHSECONDS
+
+  read -r _ u n s idl w irq sirq steal _ < /proc/stat
+  cur_total=$(( u + n + s + idl + w + irq + sirq + steal ))
+  cur_idle=$(( idl + w ))
+
+  # Lowest-metric default route wins; tailscale and friends add their own.
+  iface=""; local best=""
+  while read -r _if _dest _gw _fl _rc _us _metric _; do
+    [[ $_dest == 00000000 ]] || continue
+    if [[ -z $best ]] || (( _metric < best )); then best=$_metric; iface=$_if; fi
+  done < /proc/net/route
+
+  cur_rx=0 cur_tx=0
+  if [[ -n $iface ]]; then
+    read -r cur_rx < "/sys/class/net/$iface/statistics/rx_bytes" 2>/dev/null
+    read -r cur_tx < "/sys/class/net/$iface/statistics/tx_bytes" 2>/dev/null
+    case $cur_rx in ''|*[!0-9]*) cur_rx=0 ;; esac
+    case $cur_tx in ''|*[!0-9]*) cur_tx=0 ;; esac
+  fi
+
+  # Fields 3 and 7 of the stat line are sectors read and written. Sectors are
+  # always 512B here regardless of the drive's real block size.
+  cur_rd=0 cur_wr=0
+  for p in "${D_PATH[@]}"; do
+    read -r _a _b _rs _c _d _e _ws _ < "$p" 2>/dev/null || continue
+    cur_rd=$(( cur_rd + _rs )); cur_wr=$(( cur_wr + _ws ))
+  done
+
+  # SwapFree is line 16 of 58; breaking there beats a full scan 3:1.
+  mem_total_kb=0 mem_avail_kb=0 swap_total_kb=0 swap_free_kb=0
+  while read -r key val _; do
+    case $key in
+      MemTotal:)     mem_total_kb=$val ;;
+      MemAvailable:) mem_avail_kb=$val ;;
+      SwapTotal:)    swap_total_kb=$val ;;
+      SwapFree:)     swap_free_kb=$val; break ;;
+    esac
+  done < /proc/meminfo
+
+  # GPU load sources.
+  for i in "${!G_ID[@]}"; do
+    case ${G_METHOD[i]} in
+      rc6)  read -r v < "${G_PATH[i]}" 2>/dev/null || v=0
+            case $v in ''|*[!0-9]*) v=0 ;; esac
+            C_RC6[i]=$v ;;
+      busy) read -r v < "${G_PATH[i]}" 2>/dev/null || v=0
+            case $v in ''|*[!0-9]*) v=0 ;; esac
+            C_RC6[i]=$v ;;
+    esac
+  done
+
+  # nvidia-smi costs ~48ms and is the most expensive thing here. A card
+  # reporting load is re-read every tick, so the graph keeps full resolution
+  # for the moment work lands on it; an idle one is trusted for NV_IDLE_TTL.
+  # There is no cheap sysfs gate: an MX150 reports "Runtime D3: Not supported"
+  # and sits permanently in D0, so polling is the only way to ask.
+  if (( NV_COPROC )); then
+    # Drain to the newest line. `read -t 0` tests for data without waiting, so
+    # an empty pipe costs nothing; a blocking read here would stall the tick.
+    local nvline
+    while read -t 0 -u "$NV_FD" 2>/dev/null; do
+      read -r -u "$NV_FD" nvline 2>/dev/null || { NV_COPROC=0; break; }
+      IFS=',' read -r NV_UTIL NV_TEMP NV_VUSED NV_VTOTAL <<< "$nvline"
+      NV_UTIL=${NV_UTIL// /}; NV_TEMP=${NV_TEMP// /}
+      NV_VUSED=${NV_VUSED// /}; NV_VTOTAL=${NV_VTOTAL// /}
+      NV_TS=$now_s
+    done
+  elif (( NV_PRESENT )); then
+    local busy=0
+    case $NV_UTIL in ''|0|*[!0-9]*) ;; *) busy=1 ;; esac
+    if (( busy || NV_TS == 0 || now_s - NV_TS >= NV_IDLE_TTL )); then
+      local nvline
+      if nvline=$(nvidia-smi --query-gpu=utilization.gpu,temperature.gpu,memory.used,memory.total \
+                    --format=csv,noheader,nounits 2>/dev/null); then
+        IFS=',' read -r NV_UTIL NV_TEMP NV_VUSED NV_VTOTAL <<< "$nvline"
+        NV_UTIL=${NV_UTIL// /}; NV_TEMP=${NV_TEMP// /}
+        NV_VUSED=${NV_VUSED// /}; NV_VTOTAL=${NV_VTOTAL// /}
+        NV_TS=$now_s
+      fi
+    fi
+    # A powered-down card answers "[N/A]" rather than a number.
+    case $NV_UTIL   in ''|*[!0-9]*) NV_UTIL="" ;; esac
+    case $NV_TEMP   in ''|*[!0-9]*) NV_TEMP="" ;; esac
+    case $NV_VUSED  in ''|*[!0-9]*) NV_VUSED=0 ;; esac
+    case $NV_VTOTAL in ''|*[!0-9]*) NV_VTOTAL=0 ;; esac
+  fi
+
+  # Thermals. Only a sensor that `tracks` a load entry drives a live dial and
+  # needs per-tick resolution; everything else is panel context and rides a
+  # cadence. Reading all seven every tick measured 4ms — half the loop — on a
+  # machine where six of them are decoration.
+  local ttl
+  for i in "${!T_ID[@]}"; do
+    if (( T_SLOW[i] )); then
+      ttl=$SLOW_TEMP_TTL
+    elif [[ -z ${T_TRACKS[i]} ]]; then
+      ttl=$AUX_TEMP_TTL
+    else
+      ttl=0
+    fi
+    (( ttl > 0 && now_s - T_TS[i] < ttl )) && continue
+    read -r v < "${T_PATH[i]}" 2>/dev/null || continue
+    case $v in ''|0|*[!0-9]*) continue ;; esac
+    T_VAL[i]=$(( v / 1000 )); T_TS[i]=$now_s
+  done
+
+  # Leaderboard: one sweep per window boundary.
+  if (( CG_OK && now_s - LEADER_TS >= LEADER_WINDOW )); then
+    sweep_leaderboard
+    (( LEADER_TS > 0 )) && render_leaderboard   # first pass only sets baselines
+    LEADER_TS=$now_s
+  fi
+
+  # Filesystem capacity moves by fractions of a percent an hour.
+  if (( now_s - CAP_TS >= CAP_TTL )); then
+    for i in "${!C_ID[@]}"; do
+      local line
+      if line=$(df -B1 --output=used,size "${C_MOUNT[i]}" 2>/dev/null | tail -1); then
+        read -r CAP_USED[i] CAP_SIZE[i] <<< "$line"
+        case ${CAP_USED[i]:-} in ''|*[!0-9]*) CAP_USED[i]=0 ;; esac
+        case ${CAP_SIZE[i]:-} in ''|*[!0-9]*) CAP_SIZE[i]=0 ;; esac
+      fi
+    done
+    CAP_TS=$now_s
+  fi
+}
+
+# ================================================================= emit =====
+
+emit() {
+  local i first d_wall_us d_total d_idle cpu_pct pct sep
+  d_wall_us=$(( wall_us - prev_wall ))
+  (( d_wall_us > 0 )) || d_wall_us=1
+
+  cpu_pct=0
+  d_total=$(( cur_total - prev_total ))
+  if (( have_prev && d_total > 0 )); then
+    d_idle=$(( cur_idle - prev_idle ))
+    cpu_pct=$(( (d_total - d_idle) * 100 / d_total ))
+  fi
+  (( cpu_pct < 0 )) && cpu_pct=0; (( cpu_pct > 100 )) && cpu_pct=100
+
+  printf '{"load":['
+  printf '{"id":"cpu","label":"CPU","pct":%d,"scale":"all cores"}' "$cpu_pct"
+
+  for i in "${!G_ID[@]}"; do
+    case ${G_METHOD[i]} in
+      rc6)
+        # Wall time not spent in rc6 is busy time.
+        pct=0
+        if (( have_prev )); then
+          local d_rc6=$(( C_RC6[i] - ${P_RC6[i]:-0} ))
+          pct=$(( 100 - d_rc6 * 100000 / d_wall_us ))
+          (( pct < 0 )) && pct=0; (( pct > 100 )) && pct=100
+        fi
+        printf ',{"id":"%s","label":"%s","pct":%d,"scale":"i915 rc6 residency"}' \
+          "${G_ID[i]}" "${G_LABEL[i]}" "$pct"
+        ;;
+      busy)
+        printf ',{"id":"%s","label":"%s","pct":%d,"scale":"amdgpu busy percent"}' \
+          "${G_ID[i]}" "${G_LABEL[i]}" "${C_RC6[i]:-0}"
+        ;;
+      nvsmi)
+        # Absent when the card gives no usable reading — the view drops it
+        # rather than drawing a flat zero.
+        [[ -n $NV_UTIL ]] || continue
+        printf ',{"id":"%s","label":"%s","pct":%d,"scale":"nvidia-smi utilization","vramUsed":%d,"vramTotal":%d}' \
+          "${G_ID[i]}" "${G_LABEL[i]}" "$NV_UTIL" "$NV_VUSED" "$NV_VTOTAL"
+        ;;
+    esac
+  done
+  printf ']'
+
+  printf ',"temps":['
+  first=1
+  for i in "${!T_ID[@]}"; do
+    [[ -n ${T_VAL[i]} ]] || continue
+    (( first )) || printf ','
+    first=0
+    printf '{"id":"%s","chip":"%s","label":"%s","c":%d,"crit":%s,"tracks":[' \
+      "${T_ID[i]}" "${T_CHIP[i]}" "${T_LABEL[i]}" \
+      "${T_VAL[i]}" "${T_CRIT[i]:-null}"
+    sep=""
+    for t in ${T_TRACKS[i]}; do printf '%s"%s"' "$sep" "$t"; sep=","; done
+    printf ']}'
+  done
+  # The NVIDIA sensor is not an hwmon node; it arrives with the utilisation.
+  if (( NV_PRESENT )) && [[ -n $NV_TEMP ]]; then
+    (( first )) || printf ','
+    printf '{"id":"nvidia/gpu","chip":"nvidia","label":"%s","c":%d,"crit":null,"tracks":["dgpu"]}' \
+      "$NV_LABEL" "$NV_TEMP"
+  fi
+  printf ']'
+
+  printf ',"caps":['
+  first=1
+  for i in "${!C_ID[@]}"; do
+    (( ${CAP_SIZE[i]:-0} > 0 )) || continue
+    (( first )) || printf ','
+    first=0
+    printf '{"id":"%s","label":"%s","used":%d,"size":%d,"pct":%d}' \
+      "${C_ID[i]}" "${C_LABEL[i]}" \
+      "${CAP_USED[i]}" "${CAP_SIZE[i]}" \
+      "$(( CAP_USED[i] * 100 / CAP_SIZE[i] ))"
+  done
+  printf ']'
+
+  local mem_used_kb=0 mem_pct=0
+  if (( mem_total_kb > 0 )); then
+    mem_used_kb=$(( mem_total_kb - mem_avail_kb ))
+    mem_pct=$(( mem_used_kb * 100 / mem_total_kb ))
+  fi
+  printf ',"mem":{"pct":%d,"used":%d,"total":%d,"swapUsed":%d,"swapTotal":%d}' \
+    "$mem_pct" $(( mem_used_kb * 1024 )) $(( mem_total_kb * 1024 )) \
+    $(( (swap_total_kb - swap_free_kb) * 1024 )) $(( swap_total_kb * 1024 ))
+
+  # Bytes per second, scaled by 1e6/d_wall_us rather than divided by seconds so
+  # a sub-second window keeps its precision.
+  local nd=0 nu=0 dr=0 dw=0
+  if (( have_prev )); then
+    (( cur_rx > prev_rx )) && nd=$(( (cur_rx - prev_rx) * 1000000 / d_wall_us ))
+    (( cur_tx > prev_tx )) && nu=$(( (cur_tx - prev_tx) * 1000000 / d_wall_us ))
+    (( cur_rd > prev_rd )) && dr=$(( (cur_rd - prev_rd) * 512 * 1000000 / d_wall_us ))
+    (( cur_wr > prev_wr )) && dw=$(( (cur_wr - prev_wr) * 512 * 1000000 / d_wall_us ))
+  fi
+  esc "$iface"
+  printf ',"net":{"iface":"%s","down":%d,"up":%d}' "$ESC" "$nd" "$nu"
+  printf ',"disk":{"read":%d,"write":%d}' "$dr" "$dw"
+  [[ -n $LEADER_JSON ]] && printf ',%s' "$LEADER_JSON"
+  printf '}\n'
+
+}
+
+# Roll the current sample into the previous one. Separate from emit() so the
+# priming sample can establish a baseline without printing a line of zeroes.
+commit() {
+  local i
+  prev_wall=$wall_us prev_total=$cur_total prev_idle=$cur_idle
+  prev_rx=$cur_rx prev_tx=$cur_tx prev_rd=$cur_rd prev_wr=$cur_wr
+  for i in "${!G_ID[@]}"; do P_RC6[i]=${C_RC6[i]:-0}; done
+  have_prev=1
+}
+
+# ================================================================= main =====
+
+discover
+
+if [[ $MODE == discover ]]; then
+  printf 'GPUs (%d)\n' "${#G_ID[@]}"
+  for i in "${!G_ID[@]}"; do
+    printf '  %-5s %-40s method=%-6s %s\n' "${G_ID[i]}" "${G_LABEL[i]}" "${G_METHOD[i]}" "${G_PATH[i]}"
+  done
+  printf 'Temps (%d)   [slow = own 60s cadence]\n' "${#T_ID[@]}"
+  for i in "${!T_ID[@]}"; do
+    printf '  %-18s %-18s crit=%-5s slow=%s tracks=[%s]\n' \
+      "${T_ID[i]}" "${T_LABEL[i]}" "${T_CRIT[i]:-none}" "${T_SLOW[i]}" "${T_TRACKS[i]}"
+  done
+  printf 'Disks (%d)\n' "${#D_PATH[@]}"
+  for i in "${!D_PATH[@]}"; do printf '  %s\n' "${D_PATH[i]}"; done
+  printf 'Filesystems (%d)\n' "${#C_ID[@]}"
+  for i in "${!C_ID[@]}"; do printf '  %-24s %s\n' "${C_ID[i]}" "${C_MOUNT[i]}"; done
+  exit 0
+fi
+
+if [[ $MODE == stream ]]; then
+  # A pipe that never delivers, so `read -t` is a fork-free sleep. `sleep`
+  # would be a ~5ms exec on every tick.
+  exec {SLEEPFD}<> <(:)
+  interval_s=$(( INTERVAL_MS / 1000 )).$(printf '%03d' $(( INTERVAL_MS % 1000 )))
+  # Prime the counters so the first emitted line already carries real rates.
+  sample; commit
+  read -t "$interval_s" -u "$SLEEPFD" _
+  while :; do
+    sample
+    emit
+    commit
+    read -t "$interval_s" -u "$SLEEPFD" _
+  done
+else
+  sample; commit
+  exec {SLEEPFD}<> <(:)
+  read -t 0.25 -u "$SLEEPFD" _
+  sample
+  emit
+fi

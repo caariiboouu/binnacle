@@ -1,0 +1,69 @@
+MIT License
+
+Copyright (c) 2026 Joel Cuthriell
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+================================================================================
+EXTERNAL DEPENDENCIES
+================================================================================
+
+Binnacle bundles no third-party code. It contains no vendored libraries, no
+compiled binaries, and no downloaded artifacts. Everything in this repository
+is original work under the MIT license above.
+
+It invokes the following programs from the host system at runtime. Each is used
+through its documented command-line interface only; none is redistributed here,
+and each remains under its own license as installed by your distribution.
+
+REQUIRED
+  bash            GNU Bash                          GPL-3.0-or-later
+                  Runs binnacle-collect.
+  grep            GNU grep                          GPL-3.0-or-later
+                  Reads cgroup cpu.stat counters in a single pass.
+  df              GNU coreutils                     GPL-3.0-or-later
+                  Filesystem capacity, behind a 300 s cache.
+
+OPTIONAL — absent without error
+  lspci           pciutils                          GPL-2.0-or-later
+                  Human-readable GPU names, once at startup. Without it,
+                  GPUs fall back to generic vendor labels.
+  nvidia-smi      NVIDIA proprietary driver         NVIDIA license
+                  NVIDIA utilisation, temperature and VRAM. Without it, no
+                  discrete-GPU instrument is created. Run as a long-lived
+                  poller only where the card reports no runtime-D3 support;
+                  on cards that can runtime-suspend, a slower one-shot poll
+                  is used instead so the GPU is not held awake.
+  btop            btop++                            Apache-2.0
+                  Launched by the "Open btop" button, if installed.
+
+PLATFORM INTERFACES
+  Read-only, via the kernel's stable interfaces:
+    /proc/stat, /proc/meminfo, /proc/net/route, /proc/<pid>/stat,
+    /proc/<pid>/comm, /proc/mounts
+    /sys/class/hwmon, /sys/class/drm, /sys/class/net, /sys/block
+    /sys/fs/cgroup (cgroup v2 unified hierarchy, cpu controller)
+
+  Qt 6 / QtQuick, Quickshell, and the Omarchy shell's own QML modules
+  (qs.Commons, qs.Ui) are runtime hosts provided by the platform, not
+  redistributed here.
+
+Binnacle requires no elevated privileges, installs no sudoers policy, opens no
+network connections, and writes no files outside its own plugin directory.
