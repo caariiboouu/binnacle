@@ -150,8 +150,14 @@ To see what Binnacle found on your machine:
 
 ## Privileges
 
-None. Binnacle requires no root, installs no sudoers policy, ships no compiled binaries,
-makes no network connections, and writes no files outside its own directory.
+None. Binnacle needs no elevated privileges, ships no compiled binaries, and makes no
+network connections.
+
+The only file it writes is your `shell.json`, and only when you act — flipping a bar
+toggle or a temperature switch, or calling the IPC. Each write goes through the shell's
+own `mutateShellConfig` (the same API the bar uses to persist a drag-and-drop) and
+touches only this widget's own entry. Nothing is written on install, on start, or in the
+background.
 
 ## License
 
