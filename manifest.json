@@ -2,15 +2,17 @@
   "schemaVersion": 1,
   "id": "com.cuthriell.binnacle",
   "name": "Binnacle",
-  "version": "5.5.0",
-  "author": "j",
+  "version": "1.0.0",
+  "author": "Joel Cuthriell",
   "license": "MIT",
   "description": "System instruments for the bar: discovers every sensor, GPU and filesystem present and builds instruments for what it finds, with CPU-by-program accounting that still sees processes after they exit.",
   "kinds": [
-    "bar-widget"
+    "bar-widget",
+    "service"
   ],
   "entryPoints": {
-    "barWidget": "Panel.qml"
+    "barWidget": "Panel.qml",
+    "service": "Service.qml"
   },
   "barWidget": {
     "displayName": "Binnacle",
@@ -42,7 +44,9 @@
       "placeNet": "Bar + panel",
       "placeDisk": "Bar + panel",
       "placeTop": "Panel only",
-      "leaderWindow": 60
+      "leaderWindow": 60,
+      "tempUnit": "Celsius",
+      "tempStyle": "Dial"
     },
     "schema": [
       {
@@ -204,6 +208,28 @@
         "max": 600,
         "step": 10,
         "description": "One cgroup sweep per window (~19ms). Longer windows cost less per tick."
+      },
+      {
+        "key": "tempUnit",
+        "type": "enum",
+        "label": "Temperature unit",
+        "options": [
+          "Celsius",
+          "Fahrenheit"
+        ],
+        "defaultValue": "Celsius",
+        "description": "Unit for every displayed temperature. Dial scales stay physical; only the numbers convert."
+      },
+      {
+        "key": "tempStyle",
+        "type": "enum",
+        "label": "Bar temperature style",
+        "options": [
+          "Dial",
+          "Degrees"
+        ],
+        "defaultValue": "Dial",
+        "description": "How the bar strip shows a temperature: an arc dial, or the reading itself."
       }
     ]
   }

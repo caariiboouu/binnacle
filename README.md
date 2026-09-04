@@ -32,14 +32,16 @@ CPU burned in one window was unattributable to any surviving PID. Builds, script
 bursts are exactly the things that finish before you look at them, and they are exactly
 what this catches.
 
-**It stays out of the way.** One long-lived collector, not a process per sample. Steady
-state is roughly 7 ms of CPU per second — about 0.7 % of one core — including the render
-path. Panel contents are not instantiated while the panel is closed.
+**It stays out of the way.** One long-lived collector, not a process per sample, and
+exactly one collector no matter how many monitors you have — the data plane is a
+single shell-wide service, so a three-monitor setup samples your machine once, not three
+times. Steady state is roughly 7 ms of CPU per second — about 0.7 % of one core —
+including the render path. Panel contents are not instantiated while the panel is closed.
 
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/YOURNAME/binnacle --enable
+omarchy plugin add https://github.com/caariiboouu/binnacle --enable
 ```
 
 Then pick a bar section when prompted, or place it later from **Setup → Plugins**.
@@ -87,8 +89,33 @@ Covering CPU, integrated GPU, discrete GPU, temperatures, memory, network and
 filesystems. If every instrument is demoted the widget still renders a single glyph, so
 the panel stays reachable.
 
+**Temperature** has its own two switches in the dropdown, under the instrument toggles:
+
+- **Celsius / Fahrenheit** — the unit for every displayed reading. The dial scales stay
+  physical (a sensor's real critical point), so only the numbers convert.
+- **Dial / Degrees in the bar** — whether the bar strip draws a temperature as an arc
+  dial or as the reading itself (`62°`). The dropdown always shows the exact number.
+
 Other settings: sample interval, history length per graph, graph width, icon size,
 network graph floor, temperature dial floor and ceiling, and the leaderboard window.
+
+## Scripting
+
+Binnacle exposes an IPC target, so placement and presentation can be driven from a
+script or a keybinding. Keys are the instrument families (`cpu`, `igpu`, `dgpu`, `mem`,
+`net`, `t:` for temperatures, `cap:` for filesystems).
+
+```bash
+omarchy-shell com.cuthriell.binnacle open           # open the detail panel
+omarchy-shell com.cuthriell.binnacle.bar hide net   # demote an instrument to the panel
+omarchy-shell com.cuthriell.binnacle.bar show net   # and back
+omarchy-shell com.cuthriell.binnacle.bar set tempUnit Fahrenheit
+omarchy-shell com.cuthriell.binnacle.bar set tempStyle Degrees
+omarchy-shell com.cuthriell.binnacle.bar metrics    # collector + panel state, as JSON
+```
+
+Every write is validated against the settings schema, so a typo is a no-op rather than a
+malformed `shell.json` entry.
 
 ## How it works
 
@@ -100,6 +127,20 @@ Expensive sources are handled by measurement rather than assumption: each therma
 is timed at discovery and anything slow gets its own slower cadence — on the development
 machine the NVMe composite sensor costs 7.3 ms per read against 0.4 ms for coretemp,
 because it issues a SMART command to the drive.
+
+`grep -r` over `/sys/fs/cgroup` and, on NVIDIA machines, a long-lived `nvidia-smi -l`
+reader are the two places the collector deliberately spends: both were measured to be
+cheaper than the alternatives (a bash walk of the cgroup tree, and a fresh `nvidia-smi`
+per sample), and the reasoning is written out at each site in `binnacle-collect`.
+
+### Hardware coverage
+
+Developed and measured on an Intel + NVIDIA (Optimus) ThinkPad. The Intel and NVIDIA
+paths are exercised daily. **The AMD path is written from the sysfs contract but has not
+been tested on real AMD hardware** — integrated-vs-discrete classification falls back to
+a VRAM-size heuristic when the PCI bus is ambiguous, and an AMD GPU's thermal sensor is
+tied to its card by PCI address. If you run AMD and something is misfiled, the reading is
+still correct; only the icon or strip order would be wrong. Reports are very welcome.
 
 To see what Binnacle found on your machine:
 

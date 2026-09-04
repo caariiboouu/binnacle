@@ -1,7 +1,6 @@
 import QtQuick
 import QtQuick.Controls
 import Quickshell
-import Quickshell.Io
 import qs.Commons
 import qs.Ui
 
@@ -23,6 +22,31 @@ Panel {
   readonly property string barFont: bar ? bar.fontFamily : Style.font.family
 
   readonly property int barSize: bar ? bar.barSize : Style.bar.sizeHorizontal
+
+  // The shared data plane. One Service.qml instance exists per shell however
+  // many monitors build this widget — each monitor's bar creates its own copy
+  // of this Panel, and before the service split every copy ran its own
+  // collector process. ensureService both fetches and lazily creates the
+  // singleton; everything below binds to its stats/hist/summary.
+  property var svc: null
+  function bindService() {
+    if (svc) return
+    if (bar && bar.shell && typeof bar.shell.ensureService === "function")
+      svc = bar.shell.ensureService(moduleName)
+    if (svc) pushConfig()
+  }
+  // The service owns the collector but the settings live on this widget's
+  // shell.json entry, so the view pushes them down. Idempotent across
+  // monitors: every panel pushes the same values.
+  function pushConfig() {
+    if (svc) svc.configure(refreshInterval, historyLength, leaderWindow, useF)
+  }
+  Component.onCompleted: bindService()
+  onBarChanged: bindService()
+  onRefreshIntervalChanged: pushConfig()
+  onHistoryLengthChanged: pushConfig()
+  onLeaderWindowChanged: pushConfig()
+  onUseFChanged: pushConfig()
 
   readonly property int refreshInterval: setting("interval", 2000)
   readonly property int historyLength: setting("history", 32)
@@ -51,13 +75,22 @@ Panel {
   // do publish one use theirs: this NVMe crits at 87°C, the package at 100.
   readonly property real tempCeiling: setting("tempCeilingC", 100)
 
+  // Temperature presentation. The collector always speaks Celsius (so do the
+  // dial scales, floors and ceilings — they are physical); conversion happens
+  // only where a number is shown. tempStyle swaps the bar strip's arc dials
+  // for the plain reading.
+  readonly property bool useF: setting("tempUnit", "Celsius") === "Fahrenheit"
+  readonly property bool tempDegreesInBar: setting("tempStyle", "Dial") === "Degrees"
+  readonly property string tempSuffix: useF ? "°F" : "°C"
+  function displayTemp(c) { return useF ? Math.round(c * 9 / 5 + 32) : Math.round(c) }
+
   // Where each kind of instrument appears. The bar strip is a scarce, always-on
   // surface and the panel is not, so every instrument can be demoted to the
   // dropdown without being lost. Stored as inline settings on this widget's
-  // shell.json entry — the single source of truth — which the panel's toggles
-  // write back through bar.shell.mutateShellConfig(), the same path the bar's
-  // own drag-and-drop persists through. The Bar patches `settings` on the live
-  // widget after a write, so the strip follows a switch with no restart.
+  // shell.json entry — the single source of truth — written back through the
+  // service (the same mutateShellConfig path the bar's own drag-and-drop
+  // uses). The Bar patches `settings` on every live widget instance after a
+  // write, so all monitors follow a switch with no restart.
   readonly property string placeCpu:   setting("placeCpu",   "Bar + panel")
   readonly property string placeIgpu:  setting("placeIgpu",  "Bar + panel")
   readonly property string placeDgpu:  setting("placeDgpu",  "Bar + panel")
@@ -83,76 +116,11 @@ Panel {
   function inBar(key) { return placementOf(key) === "Bar + panel" }
   function inPanel(key) { return placementOf(key) !== "Hidden" }
 
-  // The one setting a placement key writes to. "t:" and "cap:" stand for their
-  // whole families, which is also all the settings can express.
-  function placementSettingKey(key) {
-    if (key === "cpu") return "placeCpu"
-    if (key === "igpu") return "placeIgpu"
-    if (key === "dgpu") return "placeDgpu"
-    if (key === "mem") return "placeMem"
-    if (key === "net") return "placeNet"
-    if (key.indexOf("t:") === 0) return "placeTemps"
-    if (key.indexOf("cap:") === 0) return "placeDisk"
-    return ""
-  }
-
-  function setPlacementValue(key, value) {
-    var sk = placementSettingKey(key)
-    if (!sk) return
-    if (value !== "Bar + panel" && value !== "Panel only" && value !== "Hidden") return
-    if (!bar || !bar.shell || typeof bar.shell.mutateShellConfig !== "function") return
-    var id = root.moduleName
-    bar.shell.mutateShellConfig(function(config) {
-      if (!config.bar || !config.bar.layout) return
-      var regions = ["left", "center", "right"]
-      for (var r = 0; r < regions.length; r++) {
-        var entries = config.bar.layout[regions[r]]
-        if (!Array.isArray(entries)) continue
-        for (var i = 0; i < entries.length; i++) {
-          var e = entries[i]
-          // A bare-string entry is legal shell.json; give it a body to hold
-          // the setting rather than assuming the object form.
-          if (e === id) { var o = { id: id }; o[sk] = value; entries[i] = o; return }
-          if (e && typeof e === "object" && e.id === id) { e[sk] = value; return }
-        }
-      }
-    })
-  }
-
-  function setBarVisible(key, show) {
-    // From "Hidden", switching on restores the instrument everywhere — a
-    // toggle that could only reach "Panel only" would look dead.
-    setPlacementValue(key, show ? "Bar + panel" : "Panel only")
-  }
-
-  // Scriptable placement, and the cheapest proof this version of the QML is
-  // actually mounted: `omarchy-shell com.cuthriell.binnacle.bar hide cpu`.
-  IpcHandler {
-    target: "com.cuthriell.binnacle.bar"
-
-    function show(key: string): void { root.setBarVisible(key, true) }
-    function hide(key: string): void { root.setBarVisible(key, false) }
-    function place(key: string, value: string): void { root.setPlacementValue(key, value) }
-
-    // The refit inputs, readable from a terminal. This is how the height
-    // budget was debugged, and how to re-check it on a new screen or theme.
-    function metrics(): string {
-      return JSON.stringify({
-        cardH: panel.availableCardHeight,
-        inset: panel.verticalContentInset,
-        budget: root.contentBudget,
-        columnH: panelColumn.implicitHeight,
-        leftH: leftPane.implicitHeight,
-        rightH: rightPane.implicitHeight,
-        viewportH: scrollArea.height,
-        graphH: root.blockGraphH,
-        blocks: root.panelBlocks.length,
-        topRows: root.topRows.length,
-        compact: root.compactPanel,
-        opened: root.opened
-      })
-    }
-  }
+  // Placement and presentation writes go through the service, which holds the
+  // single write path into this widget's shell.json entry and the one
+  // com.cuthriell.binnacle.bar IPC target — see Service.qml.
+  function setBarVisible(key, show) { if (svc) svc.setBarVisible(key, show) }
+  function writeSetting(key, value) { if (svc) svc.writeSetting(key, value) }
 
   // Instrument geometry. On a horizontal bar an instrument is a wide, short box
   // laid out along the bar; on a vertical one the bar's width is the budget, so
@@ -169,13 +137,12 @@ Panel {
   // header of binnacle-collect. Nothing below names a chip, a vendor or a
   // sampling technique: the machine says what it has, and this builds
   // instruments for whatever that turns out to be.
-  property var stats: ({ load: [], temps: [], caps: [], mem: {}, net: {}, disk: {} })
+  readonly property var stats: (svc && svc.stats) ? svc.stats
+    : ({ load: [], temps: [], caps: [], mem: {}, net: {}, disk: {} })
 
-  // Histories keyed by instrument id. A single object rather than one property
-  // per metric, because the set of metrics is not known until the collector
-  // reports. Reassigned wholesale each sample: mutating in place would not
-  // emit the change signal the graph bindings depend on.
-  property var hist: ({})
+  // Histories keyed by instrument id, owned by the service. Reassigned
+  // wholesale there each sample, which is what re-fires every binding here.
+  readonly property var hist: (svc && svc.hist) ? svc.hist : ({})
 
   readonly property var glyphs: ({
     cpu: "󰻠", igpu: "󰢮", dgpu: "󰾲", gpu: "󰢮",
@@ -237,7 +204,11 @@ Panel {
       var t = tempTracking(L[i].id)
       if (t && !dialled[t.id] && inBar("t:" + t.id)) {
         dialled[t.id] = true
-        out.push({ key: "t:" + t.id, icon: glyphs.temp, kind: "dial", name: L[i].label + " temp" })
+        // "temp" renders the plain reading; "dial" the arc. The user picks
+        // with the tempStyle toggle.
+        out.push({ key: "t:" + t.id, icon: glyphs.temp,
+                   kind: tempDegreesInBar ? "temp" : "dial",
+                   name: L[i].label + " temp" })
       }
     }
     if (inBar("mem")) out.push({ key: "mem", icon: glyphs.mem, kind: "graph", name: "Memory" })
@@ -288,13 +259,6 @@ Panel {
   }
 
   // ---- history --------------------------------------------------------------
-  function pushed(arr, value) {
-    var next = (arr || []).slice()
-    next.push(value)
-    while (next.length > historyLength) next.shift()
-    return next
-  }
-
   function peak(arr) {
     var m = 0
     for (var i = 0; i < (arr || []).length; i++) if (arr[i] > m) m = arr[i]
@@ -398,7 +362,7 @@ Panel {
     }
     if (key.indexOf("t:") === 0) {
       var t = tempEntry(key.substring(2))
-      return t ? t.c + "°C" : "—"
+      return t ? displayTemp(t.c) + tempSuffix : "—"
     }
     var l = loadEntry(key)
     if (!l) return "—"
@@ -423,7 +387,8 @@ Panel {
     if (key.indexOf("t:") === 0) {
       var t = tempEntry(key.substring(2))
       if (!t) return ""
-      return tempFloor + " – " + critOf(t) + "°C   ·   " + t.label
+      return displayTemp(tempFloor) + " – " + displayTemp(critOf(t)) + tempSuffix
+             + "   ·   " + t.label
              + (t.chip && t.chip !== t.label ? "   ·   " + t.chip : "")
              + (t.crit === null || t.crit === undefined ? "   ·   no critical point published" : "")
     }
@@ -431,19 +396,26 @@ Panel {
     return l ? "0 – 100%   ·   " + l.label + "   ·   " + l.scale : ""
   }
 
-  // The dropdown's bar toggles. Deliberately NOT a binding on `stats`: a
-  // Repeater model that re-evaluated per sample would tear down and rebuild
-  // the Toggle delegates every tick, and a switch that vanishes under the
-  // pointer between press and release drops the click. Rebuilt in ingest()
-  // only when the discovered topology actually changes.
+  // The dropdown's bar toggles, built by the service only when the discovered
+  // topology changes — NOT per sample. A Repeater model that re-evaluated per
+  // tick would tear down and rebuild the switch delegates, and a switch that
+  // vanishes under the pointer between press and release drops the click.
   //
-  // (The strip's metricDefs binding below DOES re-evaluate per tick. Measured
+  // (The strip's metricDefs binding above DOES re-evaluate per tick. Measured
   // before leaving it that way: dropping the tick rate 5x moved shell CPU by
   // ~2 ms/s, inside the +/-6.5 ms/s noise floor — so the rebuild is not worth
   // a caching layer. The toggles differ because theirs is an interaction bug,
   // not a cost.)
-  property var toggleRows: []
-  property string toggleSig: ""
+  readonly property var toggleRows: svc ? svc.toggleRows : []
+
+  // Whether any sensor drives a dial / any temperature exists at all — gates
+  // for the temperature-presentation toggles.
+  readonly property bool anyTempTracked: {
+    var rows = toggleRows
+    for (var i = 0; i < rows.length; i++) if (rows[i].key === "t:") return true
+    return false
+  }
+  readonly property bool anyTemps: (stats.temps || []).length > 0
 
   // ---- responsive panel height ----------------------------------------------
   // The dropdown should fit the screen it opens on instead of scrolling. The
@@ -487,111 +459,30 @@ Panel {
     }
     h = Math.round(Util.clamp(h, blockGraphMin, blockGraphMax))
     if (Math.abs(h - blockGraphH) >= 1) blockGraphH = h
+
+    // Publish this panel's numbers for the service's metrics IPC. Last writer
+    // wins across monitors, which is fine for a debug readout.
+    if (svc) svc.panelMetrics = {
+      cardH: panel.availableCardHeight,
+      inset: panel.verticalContentInset,
+      budget: contentBudget,
+      columnH: panelColumn.implicitHeight,
+      leftH: leftPane.implicitHeight,
+      rightH: rightPane.implicitHeight,
+      viewportH: scrollArea.height,
+      graphH: blockGraphH,
+      blocks: n,
+      compact: compactPanel,
+      opened: opened
+    }
   }
   onOpenedChanged: if (opened) Qt.callLater(refit)
   onPanelBlocksChanged: if (opened) Qt.callLater(refit)
   onContentBudgetChanged: { compactPanel = false; if (opened) Qt.callLater(refit) }
 
-  property string summary: "Reading system load…"
-
-  function buildSummary() {
-    var parts = []
-    var L = stats.load || []
-    for (var i = 0; i < L.length; i++) {
-      var p = L[i].label + " " + L[i].pct + "%"
-      var t = tempTracking(L[i].id)
-      if (t) p += " " + t.c + "°C"
-      parts.push(p)
-    }
-    var m = stats.mem || {}
-    if (m.pct !== undefined) parts.push("Mem " + m.pct + "%")
-    return parts.join("   ·   ")
-  }
-
-  // ---- collector ------------------------------------------------------------
-  // Resolved relative to this file rather than found on PATH: the helper ships
-  // inside the plugin, so `omarchy plugin add` installs a working widget. It
-  // also sidesteps the shadowing trap — /usr/share/omarchy/bin precedes
-  // ~/.local/bin on the shell's PATH, and Omarchy ships its own
-  // omarchy-system-stats.
-  readonly property string helperPath:
-    String(Qt.resolvedUrl("binnacle-collect")).replace("file://", "")
-
-  function ingest(line) {
-    var d
-    try {
-      d = JSON.parse(line)
-    } catch (e) {
-      return   // keep the last good sample rather than poisoning the histories
-    }
-    if (!d || !d.load) return
-
-    var h = {}
-    for (var k in hist) h[k] = hist[k]
-
-    var L = d.load
-    for (var i = 0; i < L.length; i++) h[L[i].id] = pushed(h[L[i].id], L[i].pct)
-    var T = d.temps || []
-    for (var j = 0; j < T.length; j++) h["t:" + T[j].id] = pushed(h["t:" + T[j].id], T[j].c)
-    h.mem = pushed(h.mem, (d.mem || {}).pct || 0)
-    h["net-down"] = pushed(h["net-down"], (d.net || {}).down || 0)
-    h["net-up"] = pushed(h["net-up"], (d.net || {}).up || 0)
-
-    stats = d
-    hist = h
-    summary = buildSummary()
-
-    var rows = []
-    for (i = 0; i < L.length; i++) rows.push({ key: L[i].id, label: L[i].label })
-    for (j = 0; j < T.length; j++)
-      if ((T[j].tracks || []).length > 0) { rows.push({ key: "t:", label: "Temperature dials" }); break }
-    rows.push({ key: "mem", label: "Memory" })
-    rows.push({ key: "net", label: "Network" })
-    if ((d.caps || []).length > 0) rows.push({ key: "cap:", label: "Disk capacity" })
-    var sig = JSON.stringify(rows)
-    if (sig !== toggleSig) { toggleSig = sig; toggleRows = rows }
-  }
-
-  // One long-lived collector, not a process per sample. A re-exec'd one-shot
-  // measured ~15ms a tick against ~7ms here, because a cold process pays
-  // execve, bash init and first-touch page faults every time.
-  Process {
-    id: statsProc
-    running: true
-    command: [root.helperPath, "--stream", String(root.refreshInterval), String(root.leaderWindow)]
-    stdout: SplitParser {
-      splitMarker: "\n"
-      onRead: line => root.ingest(line)
-    }
-    // A collector that cannot read a sensor says so on stderr; surface it
-    // rather than letting the strip silently freeze on its last good sample.
-    stderr: SplitParser {
-      splitMarker: "\n"
-      onRead: line => console.warn("binnacle collector:", line)
-    }
-    // A collector that dies (OOM, a bad sensor read) must not take the widget
-    // with it. Restart on a delay so a crash loop cannot spin the CPU.
-    onExited: (code, status) => restartTimer.start()
-  }
-
-  Timer {
-    id: restartTimer
-    interval: 5000
-    repeat: false
-    onTriggered: if (!statsProc.running) statsProc.running = true
-  }
-
-  // Changing the interval or the leaderboard window means restarting the
-  // collector: both are arguments to a process that is already running, and a
-  // Process does not relaunch when its command binding changes.
-  function restartCollector() {
-    if (statsProc.running) {
-      statsProc.running = false
-      restartTimer.start()
-    }
-  }
-  onRefreshIntervalChanged: restartCollector()
-  onLeaderWindowChanged: restartCollector()
+  // The tooltip/hero line, built by the service (it owns the data and the
+  // unit preference this widget pushes down).
+  readonly property string summary: svc ? svc.summary : "Reading system load…"
 
   // ---------------------------------------------------------------- bar strip
 
@@ -621,6 +512,23 @@ Panel {
       value: root.dialFor(parent ? parent.metricKey : "")
       marker: root.markerFor(parent ? parent.metricKey : "")
       stroke: root.barForeground
+    }
+  }
+
+  // The strip's textual temperature: the reading itself where the dial would
+  // sit, in the unit the user chose.
+  Component {
+    id: tempTextComponent
+
+    Text {
+      text: {
+        var t = root.tempOf(parent ? parent.metricKey : "")
+        return (t === null || t === undefined) ? "—" : root.displayTemp(t) + "°"
+      }
+      color: root.barForeground
+      font.family: root.barFont
+      font.pixelSize: root.iconSize * 0.9
+      renderType: Text.NativeRendering
     }
   }
 
@@ -685,14 +593,21 @@ Panel {
 
           Loader {
             // A dial is round, so it takes one side for both axes rather than
-            // the span the strip instruments use.
+            // the span the strip instruments use; a bare reading ("62°") is
+            // text and sizes itself.
             readonly property string kind: parent.modelData.kind
             readonly property bool isDial: kind === "dial"
+            readonly property bool isTemp: kind === "temp"
             visible: kind !== "none"
-            width: kind === "none" ? 0 : (isDial ? root.dialSide : root.instrumentSpan)
-            height: kind === "none" ? 0 : (isDial ? root.dialSide : root.instrumentThickness)
+            width: kind === "none" ? 0
+                 : isTemp ? (item ? item.implicitWidth : 0)
+                 : (isDial ? root.dialSide : root.instrumentSpan)
+            height: kind === "none" ? 0
+                  : isTemp ? (item ? item.implicitHeight : 0)
+                  : (isDial ? root.dialSide : root.instrumentThickness)
             sourceComponent: kind === "none" ? null
                            : isDial ? dialComponent
+                           : isTemp ? tempTextComponent
                            : kind === "gauge" ? gaugeComponent
                            : graphComponent
 
@@ -983,6 +898,92 @@ Panel {
           PanelSeparator {
             width: parent.width
             foreground: root.barForeground
+            visible: root.anyTemps
+          }
+
+          // ---------- Temperature presentation ----------
+          // Unit for every displayed reading, and dial-vs-number for the bar
+          // strip. Settings like the placement toggles above, so they persist
+          // and the settings panel shows the same state.
+          Column {
+            width: parent.width
+            spacing: Style.space(4)
+            visible: root.anyTemps
+
+            PanelSectionHeader {
+              width: parent.width
+              text: "TEMPERATURE"
+              foreground: root.barForeground
+            }
+
+            Column {
+              width: parent.width
+              spacing: Style.space(2)
+
+              Item {
+                width: parent.width
+                implicitHeight: Math.max(fLabel.implicitHeight, fSwitch.implicitHeight) + Style.space(4)
+
+                Text {
+                  id: fLabel
+                  anchors.left: parent.left
+                  anchors.right: fSwitch.left
+                  anchors.rightMargin: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
+                  elide: Text.ElideRight
+                  text: "Fahrenheit"
+                  color: root.barForeground
+                  opacity: 0.85
+                  font.family: root.barFont
+                  font.pixelSize: Style.font.body
+                }
+
+                ToggleSwitch {
+                  id: fSwitch
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  trackHeight: 18
+                  foreground: root.barForeground
+                  checked: root.useF
+                  onToggled: root.writeSetting("tempUnit", !checked ? "Fahrenheit" : "Celsius")
+                }
+              }
+
+              Item {
+                width: parent.width
+                implicitHeight: Math.max(dLabel.implicitHeight, dSwitch.implicitHeight) + Style.space(4)
+                visible: root.anyTempTracked
+
+                Text {
+                  id: dLabel
+                  anchors.left: parent.left
+                  anchors.right: dSwitch.left
+                  anchors.rightMargin: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
+                  elide: Text.ElideRight
+                  text: "Degrees in the bar, not dials"
+                  color: root.barForeground
+                  opacity: 0.85
+                  font.family: root.barFont
+                  font.pixelSize: Style.font.body
+                }
+
+                ToggleSwitch {
+                  id: dSwitch
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  trackHeight: 18
+                  foreground: root.barForeground
+                  checked: root.tempDegreesInBar
+                  onToggled: root.writeSetting("tempStyle", !checked ? "Degrees" : "Dial")
+                }
+              }
+            }
+          }
+
+          PanelSeparator {
+            width: parent.width
+            foreground: root.barForeground
           }
 
           // ---------- What used the CPU ----------
@@ -1153,7 +1154,7 @@ Panel {
     for (var i = 0; i < T.length; i++) {
       var t = T[i]
       var label = (t.chip && t.chip !== t.label) ? t.label + "  ·  " + t.chip : t.label
-      rows.push({ label: label, value: t.c + "°C" })
+      rows.push({ label: label, value: displayTemp(t.c) + tempSuffix })
     }
     var L = stats.load || []
     for (var j = 0; j < L.length; j++)
@@ -1211,7 +1212,7 @@ Panel {
       centerFontSize: Style.font.caption
       centerText: {
         var t = root.tempOf(parent ? parent.metricKey : "")
-        return (t === undefined || t === null) ? "—" : t + "°"
+        return (t === undefined || t === null) ? "—" : root.displayTemp(t) + "°"
       }
     }
   }

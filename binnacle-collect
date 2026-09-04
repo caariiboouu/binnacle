@@ -80,7 +80,7 @@ esc_all() {
 # Runs once. In --stream mode its cost is amortised to nothing, which is what
 # makes it affordable to shell out to lspci for human-readable GPU names.
 
-declare -a G_ID=() G_LABEL=() G_METHOD=() G_PATH=()        # load sources
+declare -a G_ID=() G_LABEL=() G_METHOD=() G_PATH=() G_ADDR=()  # load sources (+ PCI address)
 declare -a T_ID=() T_CHIP=() T_LABEL=() T_PATH=() T_CRIT=() T_TRACKS=() T_SLOW=() T_TS=() T_VAL=()
 declare -a D_PATH=()                              # block device stat files
 declare -a C_ID=() C_LABEL=() C_MOUNT=()                # capacity: filesystems
@@ -131,6 +131,7 @@ discover_gpus() {
         [[ -r $card/power/rc6_residency_ms ]] || continue
         G_ID+=("igpu"); G_LABEL+=("${name:-Intel integrated graphics}")
         G_METHOD+=("rc6"); G_PATH+=("$card/power/rc6_residency_ms")
+        G_ADDR+=("$addr")
         have_integrated=1
         # i915 exposes no thermal sensor of its own on any part this runs on,
         # so the package reading is the honest answer for it.
@@ -139,12 +140,24 @@ discover_gpus() {
       amdgpu|radeon)
         # amdgpu publishes a direct busy percentage — no inversion needed.
         [[ -r $dev/gpu_busy_percent ]] || continue
-        case $addr in
-          0000:00:*) id=igpu; have_integrated=1 ;;
-          *)         id=dgpu ;;
-        esac
+        # Integrated or discrete? Bus 0000:00 is the classic APU layout, but
+        # many Ryzen laptops put the iGPU on a nonzero bus, so fall back to
+        # VRAM size: an APU's carveout is shared system RAM and small, where
+        # discrete cards ship dedicated VRAM. UNTESTED HEURISTIC on real AMD
+        # hardware — if it misfiles yours, the label and dial still work; only
+        # the icon and strip order are wrong. Reports welcome.
+        id=dgpu
+        case $addr in 0000:00:*) id=igpu ;; esac
+        if [[ $id == dgpu ]] && (( ! have_integrated )) && [[ -r $dev/mem_info_vram_total ]]; then
+          local vram=0
+          read -r vram < "$dev/mem_info_vram_total" 2>/dev/null
+          case $vram in *[!0-9]*|'') vram=0 ;; esac
+          (( vram > 0 && vram < 2147483648 )) && id=igpu
+        fi
+        [[ $id == igpu ]] && have_integrated=1
         G_ID+=("$id"); G_LABEL+=("${name:-AMD graphics}")
         G_METHOD+=("busy"); G_PATH+=("$dev/gpu_busy_percent")
+        G_ADDR+=("$addr")
         ;;
       nvidia)
         # No sysfs utilisation counter exists; nvidia-smi is the only source.
@@ -152,6 +165,7 @@ discover_gpus() {
         NV_PRESENT=1; NV_LABEL=${name:-NVIDIA graphics}
         G_ID+=("dgpu"); G_LABEL+=("$NV_LABEL")
         G_METHOD+=("nvsmi"); G_PATH+=("")
+        G_ADDR+=("$addr")
         ;;
     esac
   done
@@ -159,15 +173,17 @@ discover_gpus() {
 
   # Order the strip cpu -> igpu -> dgpu. Card numbering is not vendor-stable:
   # on this machine card0 is the NVIDIA part and card1 the Intel one.
-  local -a oi=() ol=() om=() op=()
+  local -a oi=() ol=() om=() op=() oa=()
   local i pass
   for pass in igpu dgpu; do
     for i in "${!G_ID[@]}"; do
       [[ ${G_ID[i]} == "$pass" ]] || continue
       oi+=("${G_ID[i]}"); ol+=("${G_LABEL[i]}"); om+=("${G_METHOD[i]}"); op+=("${G_PATH[i]}")
+      oa+=("${G_ADDR[i]:-}")
     done
   done
   G_ID=("${oi[@]}"); G_LABEL=("${ol[@]}"); G_METHOD=("${om[@]}"); G_PATH=("${op[@]}")
+  G_ADDR=("${oa[@]}")
 }
 
 # Time one read so an expensive sensor can be put on a slower cadence. The NVMe
@@ -185,7 +201,8 @@ probe_cost() {
 
 discover_temps() {
   local h chip inp base label crit val cost tracks
-  local cpu_idx=-1
+  local cpu_idx=-1 hw_addr gi
+  local -A amd_dialled=()
   for h in /sys/class/hwmon/hwmon*; do
     read -r chip < "$h/name" 2>/dev/null || continue
     for inp in "$h"/temp*_input; do
@@ -216,7 +233,20 @@ discover_temps() {
               ;;
           esac
           ;;
-        amdgpu) tracks="igpu" ;;
+        amdgpu)
+          # Tie the sensor to the card at the same PCI address, not to a
+          # hard-coded id — an AMD *discrete* card's sensor must track dgpu.
+          # amdgpu exposes several inputs (edge/junction/mem); the first one
+          # per card drives the dial, the rest stay panel context.
+          hw_addr=$(readlink -f "$h/device" 2>/dev/null); hw_addr=${hw_addr##*/}
+          if [[ -n $hw_addr && -z ${amd_dialled[$hw_addr]:-} ]]; then
+            for gi in "${!G_ID[@]}"; do
+              [[ ${G_ADDR[gi]:-} == "$hw_addr" ]] || continue
+              tracks=${G_ID[gi]}; amd_dialled[$hw_addr]=1
+              break
+            done
+          fi
+          ;;
       esac
 
       cost=$(probe_cost "$inp")
