@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "com.cuthriell.binnacle",
   "name": "Binnacle",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Joel Cuthriell",
   "license": "MIT",
   "description": "System instruments for the bar: discovers every sensor, GPU and filesystem present and builds instruments for what it finds, with CPU-by-program accounting that still sees processes after they exit.",

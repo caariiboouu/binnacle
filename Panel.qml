@@ -546,7 +546,11 @@ Panel {
     hasVisualContent: true
     horizontalMargin: 6
     verticalPadding: 4
-    tooltipText: root.summary
+    // No hover tooltip: the strip already shows the live readings, and the
+    // click-through panel repeats the summary in its hero — a tooltip saying
+    // the same numbers a few pixels above the graphs is pure redundancy.
+    // (WidgetButton suppresses the tooltip entirely when tooltipText is empty.)
+    tooltipText: ""
 
     // WidgetButton sizes itself off its text label, which this widget does not
     // use, so drive both axes off the laid-out content instead.
