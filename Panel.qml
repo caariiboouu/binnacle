@@ -948,8 +948,20 @@ Panel {
                   anchors.verticalCenter: parent.verticalCenter
                   trackHeight: 18
                   foreground: root.barForeground
-                  checked: root.useF
-                  onToggled: root.writeSetting("tempUnit", !checked ? "Fahrenheit" : "Celsius")
+                  // Optimistic: throw the knob on click, then reconcile when
+                  // the persisted setting catches up. A unit change in dial
+                  // mode resizes nothing in the bar, so unlike a placement
+                  // change it triggers no layout pass to flush this binding —
+                  // without the optimism the knob would sit still until an
+                  // unrelated toggle poked it.
+                  readonly property bool actual: root.useF
+                  property int pending: -1   // -1 follow actual, else 0/1
+                  checked: pending === -1 ? actual : (pending === 1)
+                  onActualChanged: if (pending !== -1 && actual === (pending === 1)) pending = -1
+                  onToggled: {
+                    pending = checked ? 0 : 1
+                    root.writeSetting("tempUnit", pending === 1 ? "Fahrenheit" : "Celsius")
+                  }
                 }
               }
 
@@ -978,8 +990,15 @@ Panel {
                   anchors.verticalCenter: parent.verticalCenter
                   trackHeight: 18
                   foreground: root.barForeground
-                  checked: root.tempDegreesInBar
-                  onToggled: root.writeSetting("tempStyle", !checked ? "Degrees" : "Dial")
+                  // Optimistic, same reasoning as the unit switch above.
+                  readonly property bool actual: root.tempDegreesInBar
+                  property int pending: -1
+                  checked: pending === -1 ? actual : (pending === 1)
+                  onActualChanged: if (pending !== -1 && actual === (pending === 1)) pending = -1
+                  onToggled: {
+                    pending = checked ? 0 : 1
+                    root.writeSetting("tempStyle", pending === 1 ? "Degrees" : "Dial")
+                  }
                 }
               }
             }
