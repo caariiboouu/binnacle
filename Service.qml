@@ -58,7 +58,7 @@ Item {
 
   property string summary: "Reading system load…"
 
-  // The dropdown's bar toggles. Deliberately NOT derived per sample: a
+  // The settings screen's bar toggles. Deliberately NOT derived per sample: a
   // Repeater model that re-evaluated per tick would tear down and rebuild the
   // switch delegates, and a switch that vanishes under the pointer between
   // press and release drops the click. Rebuilt only when the discovered
@@ -167,7 +167,11 @@ Item {
     placeDisk:  ["Bar + panel", "Panel only", "Hidden"],
     placeTop:   ["Panel only", "Hidden"],
     tempUnit:   ["Celsius", "Fahrenheit"],
-    tempStyle:  ["Dial", "Degrees"]
+    tempStyle:  ["Dial", "Degrees"],
+    // A boolean rather than a two-value enum because the settings panel
+    // renders `type: boolean` as a switch, which is what this is. The list is
+    // still the allow-list: `indexOf` works the same on booleans.
+    barIcons:   [true, false]
   })
 
   function setPlacementValue(key, value) {
@@ -177,7 +181,17 @@ Item {
 
   function writeSetting(sk, value) {
     var allowed = settable[sk]
-    if (!allowed || allowed.indexOf(value) === -1) return
+    if (!allowed) return
+    // The IPC speaks strings — `set barIcons false` arrives as "false" — but a
+    // boolean setting has to land in shell.json as a real boolean or the
+    // settings panel's switch reads it back as truthy and shows the wrong
+    // state. Coerce here, once, where both callers pass through.
+    if (typeof allowed[0] === "boolean" && typeof value === "string") {
+      var v = value.toLowerCase()
+      if (v === "true" || v === "on" || v === "yes") value = true
+      else if (v === "false" || v === "off" || v === "no") value = false
+    }
+    if (allowed.indexOf(value) === -1) return
     if (!shell || typeof shell.mutateShellConfig !== "function") return
     var id = pluginId
     shell.mutateShellConfig(function(config) {

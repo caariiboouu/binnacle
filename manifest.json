@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "com.cuthriell.binnacle",
   "name": "Binnacle",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "author": "Joel Cuthriell",
   "license": "MIT",
   "description": "System instruments for the bar: discovers every sensor, GPU and filesystem present and builds instruments for what it finds, with CPU-by-program accounting that still sees processes after they exit.",
@@ -33,6 +33,7 @@
       "interval": 2000,
       "history": 32,
       "graphWidth": 38,
+      "barIcons": true,
       "netFloorBytes": 131072,
       "tempFloorC": 30,
       "tempCeilingC": 100,
@@ -80,6 +81,13 @@
         "min": 8,
         "max": 32,
         "step": 1
+      },
+      {
+        "key": "barIcons",
+        "type": "boolean",
+        "label": "Instrument icons in the bar",
+        "defaultValue": true,
+        "description": "Draw each strip instrument's glyph beside it. Off gives the bar back the width; the panel keeps its icons either way."
       },
       {
         "key": "netFloorBytes",

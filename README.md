@@ -77,27 +77,42 @@ Optional, and absent gracefully:
 
 ## Settings
 
-Configurable from **Setup → Plugins**, or inline on the widget's `shell.json` entry.
+The gear beside the panel's title opens a settings screen — the switches you actually
+reach for, at full panel width, where each one can say what it does. Escape or the back
+arrow returns to the instruments. Everything here is also in **Setup → Plugins**, or
+inline on the widget's `shell.json` entry; the two surfaces read and write the same
+settings, so they cannot disagree.
 
-Each instrument can be placed independently:
+Every switch states its value twice: with the knob, and with a glyph beside it (an open
+eye for an instrument that is in the bar, a struck-through one for a demoted one).
+Colour is the loud half of a switch and roughly one man in twelve cannot read it, so
+none of these controls asks you to.
+
+**In the bar** — one row per instrument the collector actually found, so a machine with
+no discrete GPU has no row for one. Under the hood each instrument has three placements:
 
 - **Bar + panel** — drawn in the bar strip and in the dropdown
 - **Panel only** — kept out of the strip, still in the dropdown
 - **Hidden** — not collected for display at all
 
-Covering CPU, integrated GPU, discrete GPU, temperatures, memory, network and
-filesystems. If every instrument is demoted the widget still renders a single glyph, so
-the panel stays reachable.
+The switch moves between the first two; the third is reachable from Setup → Plugins and
+from the IPC, and the row says which one is in force. If every instrument is demoted the
+widget still renders a single glyph, so the panel stays reachable.
 
-**Temperature** has its own two switches in the dropdown, under the instrument toggles:
+**Appearance**
 
-- **Celsius / Fahrenheit** — the unit for every displayed reading. The dial scales stay
-  physical (a sensor's real critical point), so only the numbers convert.
-- **Dial / Degrees in the bar** — whether the bar strip draws a temperature as an arc
-  dial or as the reading itself (`62°`). The dropdown always shows the exact number.
+- **Instrument icons in the bar** — whether each strip instrument carries its glyph.
+  Off is for a dense bar: the graphs are already told apart by shape and position, and
+  dropping the glyphs and their gaps gives back roughly a third of the strip's width.
+  The panel keeps its icons either way.
+- **Fahrenheit** — the unit for every displayed reading. The dial scales stay physical
+  (a sensor's real critical point), so only the numbers convert.
+- **Degrees in the bar, not dials** — whether the bar strip draws a temperature as an
+  arc dial or as the reading itself (`62°`). The dropdown always shows the exact number.
 
-Other settings: sample interval, history length per graph, graph width, icon size,
-network graph floor, temperature dial floor and ceiling, and the leaderboard window.
+Set-once settings stay in **Setup → Plugins**: sample interval, history length per
+graph, graph width, icon size, network graph floor, temperature dial floor and ceiling,
+and the leaderboard window.
 
 ## Scripting
 
@@ -111,6 +126,7 @@ omarchy-shell com.cuthriell.binnacle.bar hide net   # demote an instrument to th
 omarchy-shell com.cuthriell.binnacle.bar show net   # and back
 omarchy-shell com.cuthriell.binnacle.bar set tempUnit Fahrenheit
 omarchy-shell com.cuthriell.binnacle.bar set tempStyle Degrees
+omarchy-shell com.cuthriell.binnacle.bar set barIcons false
 omarchy-shell com.cuthriell.binnacle.bar metrics    # collector + panel state, as JSON
 ```
 
