@@ -26,20 +26,52 @@ Panel {
   // The shared data plane. One Service.qml instance exists per shell however
   // many monitors build this widget — each monitor's bar creates its own copy
   // of this Panel, and before the service split every copy ran its own
-  // collector process. ensureService both fetches and lazily creates the
-  // singleton; everything below binds to its stats/hist/summary.
+  // collector process; everything below binds to its stats/hist/summary.
+  //
+  // Omarchy 4.0.3 stopped handing third-party widgets the real ShellRoot and
+  // passes a PluginShellApi facade instead. That facade offers serviceFor — a
+  // lookup — where ensureService also created the singleton on demand, so the
+  // old call silently bound nothing. Older hosts keep ensureService.
   property var svc: null
   function bindService() {
     if (svc) return
-    if (bar && bar.shell && typeof bar.shell.ensureService === "function")
-      svc = bar.shell.ensureService(moduleName)
+    var host = bar ? bar.shell : null
+    if (!host) return
+    if (typeof host.serviceFor === "function") svc = host.serviceFor(moduleName)
+    else if (typeof host.ensureService === "function") svc = host.ensureService(moduleName)
     if (svc) pushConfig()
+    else if (!bindRetryTimer.running) {
+      bindRetryTimer.attempts = 0
+      bindRetryTimer.start()
+    }
+  }
+  // serviceFor cannot create the service, and the host builds it during its
+  // registry scan — which may land after this panel does. There is no signal
+  // to wait on, so poll briefly rather than sit dark for the session.
+  Timer {
+    id: bindRetryTimer
+    interval: 250
+    repeat: true
+    property int attempts: 0
+    onTriggered: {
+      attempts++
+      root.bindService()
+      if (root.svc || attempts >= 40) {
+        stop()
+        if (!root.svc)
+          console.warn("binnacle: no service after", attempts, "attempts; strip will stay empty")
+      }
+    }
   }
   // The service owns the collector but the settings live on this widget's
   // shell.json entry, so the view pushes them down. Idempotent across
   // monitors: every panel pushes the same values.
   function pushConfig() {
-    if (svc) svc.configure(refreshInterval, historyLength, leaderWindow, useF)
+    if (!svc) return
+    svc.configure(refreshInterval, historyLength, leaderWindow, useF)
+    // The service writes settings back but has no live view of the entry it is
+    // rewriting; the bar patches ours on every write, so hand it down.
+    if (typeof svc.observeSettings === "function") svc.observeSettings(settings)
   }
   Component.onCompleted: bindService()
   onBarChanged: bindService()
@@ -47,6 +79,7 @@ Panel {
   onHistoryLengthChanged: pushConfig()
   onLeaderWindowChanged: pushConfig()
   onUseFChanged: pushConfig()
+  onSettingsChanged: pushConfig()
 
   readonly property int refreshInterval: setting("interval", 2000)
   readonly property int historyLength: setting("history", 32)
@@ -101,9 +134,9 @@ Panel {
   // surface and the panel is not, so every instrument can be demoted to the
   // dropdown without being lost. Stored as inline settings on this widget's
   // shell.json entry — the single source of truth — written back through the
-  // service (the same mutateShellConfig path the bar's own drag-and-drop
-  // uses). The Bar patches `settings` on every live widget instance after a
-  // write, so all monitors follow a switch with no restart.
+  // service, which holds the one write path into that entry. The Bar patches
+  // `settings` on every live widget instance after a write, so all monitors
+  // follow a switch with no restart.
   readonly property string placeCpu:   setting("placeCpu",   "Bar + panel")
   readonly property string placeIgpu:  setting("placeIgpu",  "Bar + panel")
   readonly property string placeDgpu:  setting("placeDgpu",  "Bar + panel")

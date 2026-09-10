@@ -21,6 +21,15 @@ Item {
 
   readonly property string pluginId: "com.cuthriell.binnacle"
 
+  // This widget's shell.json entry settings, pushed down by the panel. The bar
+  // re-patches every live widget after a write, so this is the freshest base
+  // available to a host API that rewrites the entry wholesale — see
+  // writeSetting.
+  property var entrySettings: ({})
+  function observeSettings(s) {
+    if (s && typeof s === "object") entrySettings = s
+  }
+
   // Collector configuration, pushed down by the widget from its shell.json
   // settings. Defaults match the manifest so a service that starts before any
   // panel binds still collects something sensible.
@@ -192,8 +201,28 @@ Item {
       else if (v === "false" || v === "off" || v === "no") value = false
     }
     if (allowed.indexOf(value) === -1) return
-    if (!shell || typeof shell.mutateShellConfig !== "function") return
+    if (!shell) return
     var id = pluginId
+
+    // Omarchy 4.0.3 gates mutateShellConfig behind bar-replacement
+    // capabilities, which a bar widget does not have: the call is still on the
+    // plugin facade but returns false and writes nothing. updateEntryInline is
+    // the sanctioned path for a plugin to write its own entry — it replaces the
+    // entry wholesale, so carry every other setting across.
+    if (typeof shell.updateEntryInline === "function") {
+      var next = {}
+      for (var k in entrySettings) if (k !== "id") next[k] = entrySettings[k]
+      next[sk] = value
+      if (shell.updateEntryInline(id, next)) {
+        // Hold the new value now rather than waiting for the bar to patch it
+        // back, so a second toggle cannot merge over a stale base.
+        entrySettings = next
+        return
+      }
+    }
+
+    // Hosts older than 4.0.3 handed the widget the real ShellRoot.
+    if (typeof shell.mutateShellConfig !== "function") return
     shell.mutateShellConfig(function(config) {
       if (!config.bar || !config.bar.layout) return
       var regions = ["left", "center", "right"]
